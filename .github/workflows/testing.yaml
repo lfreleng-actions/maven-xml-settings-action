@@ -59,17 +59,61 @@ jobs:
           echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Running local action: ${{ github.repository }}"
+        id: settings
         uses: ./
         with:
-          input: "test input 💬"
+          server-ids: |
+            test-releases
+            test-snapshots
+            nexus3.example.org:10003
+          username: "test-user"
+          password: "p@ss&<>word"
+          mirror-id: "public"
+          mirror-url: "https://nexus.example.org/public/"
+          profile-id: "public"
+          profile-repository-url: "https://nexus.example.org/public/"
 
       - name: "Validated local action: ${{ github.repository }}"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          SETTINGS_CONTENT: ${{ steps.settings.outputs.settings-content }}
+          SETTINGS_PATH: ${{ steps.settings.outputs.settings-path }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
+          # Validate the generated settings.xml
+          set -euo pipefail
+
+          if [ ! -s "$SETTINGS_PATH" ]; then
+            echo "Error: settings file was not written ❌"; exit 1
+          fi
+
+          # The generated document must be well-formed XML. Parse it with
+          # Python's standard library, which every runner ships, instead of
+          # xmllint (libxml2-utils is no longer preinstalled on ubuntu).
+          python3 -c 'import sys, xml.dom.minidom as m; m.parse(sys.argv[1])' \
+            "$SETTINGS_PATH" \
+            || { echo "Error: settings.xml is not well-formed ❌"; exit 1; }
+
+          # Every listed server must appear, credentials must be present,
+          # and the special characters in the password must be escaped.
+          for id in test-releases test-snapshots nexus3.example.org:10003; do
+            grep -qF "<id>${id}</id>" "$SETTINGS_PATH" \
+              || { echo "Error: server '${id}' missing ❌"; exit 1; }
+          done
+          grep -qF '<password>p@ss&amp;&lt;&gt;word</password>' \
+            "$SETTINGS_PATH" \
+            || { echo "Error: password not XML-escaped ❌"; exit 1; }
+          grep -qF '<mirrorOf>*</mirrorOf>' "$SETTINGS_PATH" \
+            || { echo "Error: mirror missing ❌"; exit 1; }
+          grep -qF '<activeProfile>public</activeProfile>' "$SETTINGS_PATH" \
+            || { echo "Error: active profile missing ❌"; exit 1; }
+
+          # The output string must match the written file.
+          if [ "$SETTINGS_CONTENT" != "$(cat "$SETTINGS_PATH")" ]; then
+            echo "Error: settings-content output differs from file ❌"
+            exit 1
+          fi
+
+          echo "Validated local action: generated settings.xml is valid ✅"
           echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
 
       # yamllint disable-line rule:line-length
@@ -78,7 +122,10 @@ jobs:
         id: failure
         continue-on-error: true
         with:
-          invalid_input: "Some garbage"
+          # Provide empty required inputs: validation must reject them.
+          server-ids: ""
+          username: ""
+          password: ""
 
       # Failure testing is also important
       - name: "Error if step above did NOT fail"

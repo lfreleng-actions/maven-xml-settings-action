@@ -1,53 +1,220 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# maven-xml-settings-action
+name: "🔧 Maven XML Settings"
+description: "Generate a Maven settings.xml from supplied parameters"
 
 inputs:
-  input:
-    description: "Description of input"
+  server-ids:
+    # yamllint disable-line rule:line-length
+    description: "Maven server <id> values sharing the credentials (comma, space or newline separated)"
     required: true
+  username:
+    description: "Username applied to every listed server"
+    required: true
+  password:
+    description: "Password applied to every listed server"
+    required: true
+  mirror-id:
+    description: "Optional mirror <id>; requires mirror-url to take effect"
+    required: false
+    default: ""
+  mirror-url:
+    description: "Optional mirror <url>; requires mirror-id to take effect"
+    required: false
+    default: ""
+  mirror-of:
+    description: "Mirror <mirrorOf> selector (only used when a mirror is set)"
+    required: false
+    default: "*"
+  profile-id:
+    # yamllint disable-line rule:line-length
+    description: "Optional active profile <id>; requires profile-repository-url to take effect"
+    required: false
+    default: ""
+  profile-repository-url:
+    # yamllint disable-line rule:line-length
+    description: "Repository URL for the active profile; requires profile-id to take effect"
+    required: false
+    default: ""
+  settings-path:
+    # yamllint disable-line rule:line-length
+    description: "Path to write settings.xml to (defaults to a file under RUNNER_TEMP)"
+    required: false
+    default: ""
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  settings-content:
+    description: "The generated settings.xml content"
+    value: ${{ steps.generate.outputs.settings-content }}
+  settings-path:
+    description: "Filesystem path the settings.xml was written to"
+    value: ${{ steps.generate.outputs.settings-path }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Generate Maven settings.xml"
+      id: generate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        SERVER_IDS: ${{ inputs.server-ids }}
+        SERVER_USERNAME: ${{ inputs.username }}
+        SERVER_PASSWORD: ${{ inputs.password }}
+        MIRROR_ID: ${{ inputs.mirror-id }}
+        MIRROR_URL: ${{ inputs.mirror-url }}
+        MIRROR_OF: ${{ inputs.mirror-of }}
+        PROFILE_ID: ${{ inputs.profile-id }}
+        PROFILE_REPOSITORY_URL: ${{ inputs.profile-repository-url }}
+        SETTINGS_PATH: ${{ inputs.settings-path }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Generate a Maven settings.xml from the supplied parameters
+        set -euo pipefail
+
+        # The generated settings.xml holds credentials, so restrict new
+        # files and directories to the current user. Disable pathname
+        # expansion too, so a server id containing *, ? or [] cannot glob
+        # to filenames when the id list is word-split below.
+        umask 077
+        set -f
+
+        # Mask the password in logs regardless of how it was sourced.
+        # Percent-encode %, CR and LF first: the workflow-command parser
+        # treats those characters specially, so an unescaped value would
+        # be masked incompletely (leaking part of the secret).
+        if [ -n "$SERVER_PASSWORD" ]; then
+          mask=${SERVER_PASSWORD//'%'/'%25'}
+          mask=${mask//$'\r'/'%0D'}
+          mask=${mask//$'\n'/'%0A'}
+          echo "::add-mask::$mask"
+        fi
+
+        # Validate required inputs before generating anything.
+        if [ -z "$SERVER_USERNAME" ] || [ -z "$SERVER_PASSWORD" ]; then
+          echo "Error: username and password are required ❌"
           exit 1
         fi
 
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        # settings-path becomes a single-line GITHUB_OUTPUT entry; a CR or
+        # LF in it could inject additional outputs, so reject them.
+        case "$SETTINGS_PATH" in
+          *[$'\r\n']*)
+            echo "Error: settings-path must not contain newlines ❌"
+            exit 1
+            ;;
+        esac
+
+        # Server IDs may be comma, space or newline separated. Normalise
+        # the list once and confirm it yields at least one non-empty id;
+        # a value made up solely of separators would otherwise generate
+        # an empty <servers> block that silently drops the credentials.
+        normalized_ids=$(printf '%s' "$SERVER_IDS" | tr ',\r\n' '   ')
+        server_id_count=0
+        # shellcheck disable=SC2086
+        for server_id in $normalized_ids; do
+          [ -n "$server_id" ] && server_id_count=$((server_id_count + 1))
+        done
+        if [ "$server_id_count" -eq 0 ]; then
+          echo "Error: server-ids must contain at least one id ❌"
+          exit 1
+        fi
+
+        # XML-escape element text so credentials or IDs containing &, <
+        # or > cannot corrupt the document or inject extra elements.
+        xml_escape() {
+          printf '%s' "$1" \
+            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+        }
+
+        esc_user=$(xml_escape "$SERVER_USERNAME")
+        esc_pass=$(xml_escape "$SERVER_PASSWORD")
+
+        settings_file="${SETTINGS_PATH:-${RUNNER_TEMP:-/tmp}/settings.xml}"
+
+        # Ensure the parent directory exists so writing the file cannot
+        # fail when the caller supplies a settings-path under a directory
+        # that has not been created yet.
+        settings_dir=$(dirname -- "$settings_file")
+        mkdir -p -- "$settings_dir"
+
+        {
+          echo '<settings>'
+          echo '  <servers>'
+          # Server IDs were normalised and validated above.
+          # Intentionally unquoted: the list must word-split into IDs.
+          # shellcheck disable=SC2086
+          for server_id in $normalized_ids; do
+            [ -n "$server_id" ] || continue
+            esc_id=$(xml_escape "$server_id")
+            echo '    <server>'
+            echo "      <id>${esc_id}</id>"
+            echo "      <username>${esc_user}</username>"
+            echo "      <password>${esc_pass}</password>"
+            echo '    </server>'
+          done
+          echo '  </servers>'
+
+          if [ -n "$MIRROR_ID" ] && [ -n "$MIRROR_URL" ]; then
+            esc_mirror_id=$(xml_escape "$MIRROR_ID")
+            esc_mirror_url=$(xml_escape "$MIRROR_URL")
+            esc_mirror_of=$(xml_escape "${MIRROR_OF:-*}")
+            echo '  <mirrors>'
+            echo '    <mirror>'
+            echo "      <id>${esc_mirror_id}</id>"
+            echo "      <mirrorOf>${esc_mirror_of}</mirrorOf>"
+            echo "      <url>${esc_mirror_url}</url>"
+            echo '    </mirror>'
+            echo '  </mirrors>'
+          fi
+
+          if [ -n "$PROFILE_ID" ] && [ -n "$PROFILE_REPOSITORY_URL" ]; then
+            esc_profile_id=$(xml_escape "$PROFILE_ID")
+            esc_repo_url=$(xml_escape "$PROFILE_REPOSITORY_URL")
+            echo '  <profiles>'
+            echo '    <profile>'
+            echo "      <id>${esc_profile_id}</id>"
+            echo '      <repositories>'
+            echo '        <repository>'
+            echo "          <id>${esc_profile_id}</id>"
+            echo "          <url>${esc_repo_url}</url>"
+            echo '          <releases><enabled>true</enabled></releases>'
+            echo '          <snapshots><enabled>true</enabled></snapshots>'
+            echo '        </repository>'
+            echo '      </repositories>'
+            echo '      <pluginRepositories>'
+            echo '        <pluginRepository>'
+            echo "          <id>${esc_profile_id}</id>"
+            echo "          <url>${esc_repo_url}</url>"
+            echo '          <releases><enabled>true</enabled></releases>'
+            echo '          <snapshots><enabled>true</enabled></snapshots>'
+            echo '        </pluginRepository>'
+            echo '      </pluginRepositories>'
+            echo '    </profile>'
+            echo '  </profiles>'
+            echo '  <activeProfiles>'
+            echo "    <activeProfile>${esc_profile_id}</activeProfile>"
+            echo '  </activeProfiles>'
+          fi
+
+          echo '</settings>'
+        } > "$settings_file"
+
+        # Emit the settings content as a step output using a randomised
+        # heredoc delimiter so the XML cannot terminate the block early.
+        # Regenerate the delimiter until it is provably absent from the
+        # generated file, so a value that happens to contain the delimiter
+        # cannot close the output block prematurely.
+        delimiter="EOF_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        while grep -qF -- "$delimiter" "$settings_file"; do
+          delimiter="EOF_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
         done
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
+          echo "settings-content<<${delimiter}"
+          cat -- "$settings_file"
+          echo "${delimiter}"
+          echo "settings-path=${settings_file}"
         } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "Generated Maven settings.xml at: ${settings_file}"
