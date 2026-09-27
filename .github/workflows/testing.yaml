@@ -60,7 +60,7 @@ jobs:
 
       - name: "Running local action: ${{ github.repository }}"
         id: settings
-        uses: ./
+        uses: $/
         with:
           server-ids: |
             test-releases
@@ -118,7 +118,7 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
+        uses: $/
         id: failure
         continue-on-error: true
         with:
