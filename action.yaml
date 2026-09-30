@@ -9,14 +9,19 @@ description: "Generate a Maven settings.xml from supplied parameters"
 inputs:
   server-ids:
     # yamllint disable-line rule:line-length
-    description: "Maven server <id> values sharing the credentials (comma, space or newline separated)"
-    required: true
+    description: "Optional Maven server <id> values sharing the credentials (comma, space or newline separated); requires username and password"
+    required: false
+    default: ""
   username:
-    description: "Username applied to every listed server"
-    required: true
+    # yamllint disable-line rule:line-length
+    description: "Optional username applied to every listed server; requires password and server-ids"
+    required: false
+    default: ""
   password:
-    description: "Password applied to every listed server"
-    required: true
+    # yamllint disable-line rule:line-length
+    description: "Optional password applied to every listed server; requires username and server-ids"
+    required: false
+    default: ""
   mirror-id:
     description: "Optional mirror <id>; requires mirror-url to take effect"
     required: false
@@ -73,7 +78,7 @@ runs:
         # Generate a Maven settings.xml from the supplied parameters
         set -euo pipefail
 
-        # The generated settings.xml holds credentials, so restrict new
+        # The generated settings.xml may hold credentials, so restrict new
         # files and directories to the current user. Disable pathname
         # expansion too, so a server id containing *, ? or [] cannot glob
         # to filenames when the id list is word-split below.
@@ -91,9 +96,15 @@ runs:
           echo "::add-mask::$mask"
         fi
 
-        # Validate required inputs before generating anything.
-        if [ -z "$SERVER_USERNAME" ] || [ -z "$SERVER_PASSWORD" ]; then
-          echo "Error: username and password are required ❌"
+        # Validate inputs before generating anything. Server credentials
+        # are optional (a mirror or profile-only document is valid), but
+        # username and password must come as a pair.
+        if [ -n "$SERVER_USERNAME" ] && [ -n "$SERVER_PASSWORD" ]; then
+          has_credentials=true
+        elif [ -z "$SERVER_USERNAME" ] && [ -z "$SERVER_PASSWORD" ]; then
+          has_credentials=false
+        else
+          echo "Error: supply username and password together ❌"
           exit 1
         fi
 
@@ -107,17 +118,40 @@ runs:
         esac
 
         # Server IDs may be comma, space or newline separated. Normalise
-        # the list once and confirm it yields at least one non-empty id;
-        # a value made up solely of separators would otherwise generate
-        # an empty <servers> block that silently drops the credentials.
+        # the list once. With credentials, confirm it yields at least one
+        # non-empty id; a value made up solely of separators would
+        # otherwise generate an empty <servers> block that silently drops
+        # the credentials. Without credentials, reject any server-ids
+        # content: the action has nothing to put in those <server> entries.
         normalized_ids=$(printf '%s' "$SERVER_IDS" | tr ',\r\n' '   ')
         server_id_count=0
         # shellcheck disable=SC2086
         for server_id in $normalized_ids; do
           [ -n "$server_id" ] && server_id_count=$((server_id_count + 1))
         done
-        if [ "$server_id_count" -eq 0 ]; then
-          echo "Error: server-ids must contain at least one id ❌"
+        if [ "$has_credentials" = true ]; then
+          if [ "$server_id_count" -eq 0 ]; then
+            echo "Error: server-ids must contain at least one id ❌"
+            exit 1
+          fi
+        elif [ -n "${SERVER_IDS//[[:space:]]/}" ]; then
+          echo "Error: server-ids requires username and password ❌"
+          exit 1
+        fi
+
+        # Mirror and profile blocks render when both of their fields are
+        # set. Refuse to write a document with no content at all.
+        render_mirror=false
+        if [ -n "$MIRROR_ID" ] && [ -n "$MIRROR_URL" ]; then
+          render_mirror=true
+        fi
+        render_profile=false
+        if [ -n "$PROFILE_ID" ] && [ -n "$PROFILE_REPOSITORY_URL" ]; then
+          render_profile=true
+        fi
+        if [ "$has_credentials" = false ] && [ "$render_mirror" = false ] \
+          && [ "$render_profile" = false ]; then
+          echo "Error: set server credentials, a mirror or a profile ❌"
           exit 1
         fi
 
@@ -128,8 +162,10 @@ runs:
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
         }
 
-        esc_user=$(xml_escape "$SERVER_USERNAME")
-        esc_pass=$(xml_escape "$SERVER_PASSWORD")
+        if [ "$has_credentials" = true ]; then
+          esc_user=$(xml_escape "$SERVER_USERNAME")
+          esc_pass=$(xml_escape "$SERVER_PASSWORD")
+        fi
 
         settings_file="${SETTINGS_PATH:-${RUNNER_TEMP:-/tmp}/settings.xml}"
 
@@ -141,22 +177,26 @@ runs:
 
         {
           echo '<settings>'
-          echo '  <servers>'
-          # Server IDs were normalised and validated above.
-          # Intentionally unquoted: the list must word-split into IDs.
-          # shellcheck disable=SC2086
-          for server_id in $normalized_ids; do
-            [ -n "$server_id" ] || continue
-            esc_id=$(xml_escape "$server_id")
-            echo '    <server>'
-            echo "      <id>${esc_id}</id>"
-            echo "      <username>${esc_user}</username>"
-            echo "      <password>${esc_pass}</password>"
-            echo '    </server>'
-          done
-          echo '  </servers>'
+          # Maven's settings schema makes <servers> optional, so omit the
+          # block entirely when there are no credentials to hold.
+          if [ "$has_credentials" = true ]; then
+            echo '  <servers>'
+            # Server IDs were normalised and validated above.
+            # Intentionally unquoted: the list must word-split into IDs.
+            # shellcheck disable=SC2086
+            for server_id in $normalized_ids; do
+              [ -n "$server_id" ] || continue
+              esc_id=$(xml_escape "$server_id")
+              echo '    <server>'
+              echo "      <id>${esc_id}</id>"
+              echo "      <username>${esc_user}</username>"
+              echo "      <password>${esc_pass}</password>"
+              echo '    </server>'
+            done
+            echo '  </servers>'
+          fi
 
-          if [ -n "$MIRROR_ID" ] && [ -n "$MIRROR_URL" ]; then
+          if [ "$render_mirror" = true ]; then
             esc_mirror_id=$(xml_escape "$MIRROR_ID")
             esc_mirror_url=$(xml_escape "$MIRROR_URL")
             esc_mirror_of=$(xml_escape "${MIRROR_OF:-*}")
@@ -169,7 +209,7 @@ runs:
             echo '  </mirrors>'
           fi
 
-          if [ -n "$PROFILE_ID" ] && [ -n "$PROFILE_REPOSITORY_URL" ]; then
+          if [ "$render_profile" = true ]; then
             esc_profile_id=$(xml_escape "$PROFILE_ID")
             esc_repo_url=$(xml_escape "$PROFILE_REPOSITORY_URL")
             echo '  <profiles>'

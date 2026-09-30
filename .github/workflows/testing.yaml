@@ -22,11 +22,31 @@ permissions: {}
 jobs:
   ### Test the GitHub Action in this Repository ###
   tests:
-    name: "Test local GitHub Action"
+    name: "Test local GitHub Action (${{ matrix.case }})"
     runs-on: ubuntu-latest
     permissions:
       contents: read
     timeout-minutes: 10 # Increase this timeout value as needed
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full credentials: the output must stay byte-for-byte identical
+          # to the v0.1.1 release, captured in the fixture file.
+          - case: "full-credentials"
+            server-ids: |
+              test-releases
+              test-snapshots
+              nexus3.example.org:10003
+            username: "test-user"
+            password: "p@ss&<>word"
+            expect-servers: "true"
+          # No credentials: a mirror and profile-only document.
+          - case: "mirror-profile-only"
+            server-ids: ""
+            username: ""
+            password: ""
+            expect-servers: "false"
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -62,12 +82,9 @@ jobs:
         id: settings
         uses: $/
         with:
-          server-ids: |
-            test-releases
-            test-snapshots
-            nexus3.example.org:10003
-          username: "test-user"
-          password: "p@ss&<>word"
+          server-ids: ${{ matrix.server-ids }}
+          username: ${{ matrix.username }}
+          password: ${{ matrix.password }}
           mirror-id: "public"
           mirror-url: "https://nexus.example.org/public/"
           profile-id: "public"
@@ -78,6 +95,8 @@ jobs:
         env:
           SETTINGS_CONTENT: ${{ steps.settings.outputs.settings-content }}
           SETTINGS_PATH: ${{ steps.settings.outputs.settings-path }}
+          EXPECTED_FILE: "tests/fixtures/${{ matrix.case }}.xml"
+          EXPECT_SERVERS: ${{ matrix.expect-servers }}
         run: |
           # Validate the generated settings.xml
           set -euo pipefail
@@ -93,15 +112,34 @@ jobs:
             "$SETTINGS_PATH" \
             || { echo "Error: settings.xml is not well-formed ❌"; exit 1; }
 
-          # Every listed server must appear, credentials must be present,
-          # and the special characters in the password must be escaped.
-          for id in test-releases test-snapshots nexus3.example.org:10003; do
-            grep -qF "<id>${id}</id>" "$SETTINGS_PATH" \
-              || { echo "Error: server '${id}' missing ❌"; exit 1; }
-          done
-          grep -qF '<password>p@ss&amp;&lt;&gt;word</password>' \
-            "$SETTINGS_PATH" \
-            || { echo "Error: password not XML-escaped ❌"; exit 1; }
+          # The document must match the expected fixture byte for byte.
+          if ! cmp -- "$EXPECTED_FILE" "$SETTINGS_PATH"; then
+            diff -u -- "$EXPECTED_FILE" "$SETTINGS_PATH" || true
+            echo "Error: settings.xml differs from ${EXPECTED_FILE} ❌"
+            exit 1
+          fi
+
+          if [ "$EXPECT_SERVERS" = "true" ]; then
+            # Every listed server must appear, credentials must be
+            # present, and the special characters in the password must
+            # be escaped.
+            for id in test-releases test-snapshots nexus3.example.org:10003
+            do
+              grep -qF "<id>${id}</id>" "$SETTINGS_PATH" \
+                || { echo "Error: server '${id}' missing ❌"; exit 1; }
+            done
+            grep -qF '<password>p@ss&amp;&lt;&gt;word</password>' \
+              "$SETTINGS_PATH" \
+              || { echo "Error: password not XML-escaped ❌"; exit 1; }
+          else
+            # Without credentials there must be no server data at all.
+            for tag in '<servers>' '<server>' '<username>' '<password>'; do
+              if grep -qF "$tag" "$SETTINGS_PATH"; then
+                echo "Error: unexpected ${tag} without credentials ❌"
+                exit 1
+              fi
+            done
+          fi
           grep -qF '<mirrorOf>*</mirrorOf>' "$SETTINGS_PATH" \
             || { echo "Error: mirror missing ❌"; exit 1; }
           grep -qF '<activeProfile>public</activeProfile>' "$SETTINGS_PATH" \
@@ -116,16 +154,87 @@ jobs:
           echo "Validated local action: generated settings.xml is valid ✅"
           echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
 
+  ### Invalid input combinations must fail with a clear error ###
+  failures:
+    name: "Test input validation (${{ matrix.case }})"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10 # Increase this timeout value as needed
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: "no-inputs"
+            server-ids: ""
+            username: ""
+            password: ""
+            mirror-id: ""
+            mirror-url: ""
+            error: "Error: set server credentials, a mirror or a profile"
+          - case: "username-without-password"
+            server-ids: "test-releases"
+            username: "test-user"
+            password: ""
+            mirror-id: "public"
+            mirror-url: "https://nexus.example.org/public/"
+            error: "Error: supply username and password together"
+          - case: "password-without-username"
+            server-ids: "test-releases"
+            username: ""
+            password: "test-password"
+            mirror-id: "public"
+            mirror-url: "https://nexus.example.org/public/"
+            error: "Error: supply username and password together"
+          - case: "server-ids-without-credentials"
+            server-ids: "test-releases"
+            username: ""
+            password: ""
+            mirror-id: "public"
+            mirror-url: "https://nexus.example.org/public/"
+            error: "Error: server-ids requires username and password"
+          - case: "credentials-without-server-ids"
+            server-ids: ""
+            username: "test-user"
+            password: "test-password"
+            mirror-id: "public"
+            mirror-url: "https://nexus.example.org/public/"
+            error: "Error: server-ids must contain at least one id"
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       # yamllint disable-line rule:line-length
       - name: "Running local action: ${{ github.repository }} [Override Failure]"
         uses: $/
         id: failure
         continue-on-error: true
         with:
-          # Provide empty required inputs: validation must reject them.
-          server-ids: ""
-          username: ""
-          password: ""
+          # Supply an invalid input combination: validation must reject it.
+          server-ids: ${{ matrix.server-ids }}
+          username: ${{ matrix.username }}
+          password: ${{ matrix.password }}
+          mirror-id: ${{ matrix.mirror-id }}
+          mirror-url: ${{ matrix.mirror-url }}
 
       # Failure testing is also important
       - name: "Error if step above did NOT fail"
@@ -135,3 +244,44 @@ jobs:
           # Error if step above did NOT fail
           echo "Error: previous test step did NOT fail ❌"
           exit 1
+
+      # The step log of a composite action is not readable from a later
+      # step, so run the action's generate script directly with the same
+      # inputs and confirm it fails with the documented error message.
+      - name: "Check validation error message"
+        shell: bash
+        env:
+          SERVER_IDS: ${{ matrix.server-ids }}
+          SERVER_USERNAME: ${{ matrix.username }}
+          SERVER_PASSWORD: ${{ matrix.password }}
+          MIRROR_ID: ${{ matrix.mirror-id }}
+          MIRROR_URL: ${{ matrix.mirror-url }}
+          MIRROR_OF: "*"
+          PROFILE_ID: ""
+          PROFILE_REPOSITORY_URL: ""
+          EXPECTED_ERROR: ${{ matrix.error }}
+        run: |
+          # Check validation error message
+          set -euo pipefail
+
+          work=$(mktemp -d)
+          yq '.runs.steps[] | select(.id == "generate") | .run' action.yaml \
+            > "${work}/generate.sh"
+
+          if GITHUB_OUTPUT="${work}/output" \
+            SETTINGS_PATH="${work}/settings.xml" \
+            bash "${work}/generate.sh" > "${work}/log" 2>&1; then
+            echo "Error: generate script accepted invalid inputs ❌"
+            exit 1
+          fi
+          if ! grep -qF -- "$EXPECTED_ERROR" "${work}/log"; then
+            cat -- "${work}/log"
+            echo "Error: expected message not found: ${EXPECTED_ERROR} ❌"
+            exit 1
+          fi
+          if [ -e "${work}/settings.xml" ]; then
+            echo "Error: settings.xml written despite invalid inputs ❌"
+            exit 1
+          fi
+
+          echo "Validation rejected inputs with: ${EXPECTED_ERROR} ✅"

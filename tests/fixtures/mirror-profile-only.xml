@@ -1,0 +1,33 @@
+<settings>
+  <mirrors>
+    <mirror>
+      <id>public</id>
+      <mirrorOf>*</mirrorOf>
+      <url>https://nexus.example.org/public/</url>
+    </mirror>
+  </mirrors>
+  <profiles>
+    <profile>
+      <id>public</id>
+      <repositories>
+        <repository>
+          <id>public</id>
+          <url>https://nexus.example.org/public/</url>
+          <releases><enabled>true</enabled></releases>
+          <snapshots><enabled>true</enabled></snapshots>
+        </repository>
+      </repositories>
+      <pluginRepositories>
+        <pluginRepository>
+          <id>public</id>
+          <url>https://nexus.example.org/public/</url>
+          <releases><enabled>true</enabled></releases>
+          <snapshots><enabled>true</enabled></snapshots>
+        </pluginRepository>
+      </pluginRepositories>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>public</activeProfile>
+  </activeProfiles>
+</settings>

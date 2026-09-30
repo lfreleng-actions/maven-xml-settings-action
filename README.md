@@ -49,14 +49,17 @@ steps:
 
 | Name                   | Required | Default | Description                     |
 | ---------------------- | -------- | ------- | ------------------------------- |
-| server-ids             | True     |         | Maven server `<id>` values      |
+| server-ids             | False    | ""      | Maven server `<id>` values      |
 |                        |          |         | sharing the credentials         |
 |                        |          |         | (comma, space or newline        |
-|                        |          |         | separated)                      |
-| username               | True     |         | Username applied to every       |
-|                        |          |         | listed server                   |
-| password               | True     |         | Password applied to every       |
-|                        |          |         | listed server                   |
+|                        |          |         | separated); needs username and  |
+|                        |          |         | password                        |
+| username               | False    | ""      | Username applied to every       |
+|                        |          |         | listed server; needs password   |
+|                        |          |         | and server-ids                  |
+| password               | False    | ""      | Password applied to every       |
+|                        |          |         | listed server; needs username   |
+|                        |          |         | and server-ids                  |
 | mirror-id              | False    | ""      | Mirror `<id>`; requires         |
 |                        |          |         | mirror-url to take effect       |
 | mirror-url             | False    | ""      | Mirror `<url>`; requires        |
@@ -77,6 +80,36 @@ becomes a `<server>` entry with the given `username`/`password`. The
 mirror and profile blocks render when you set both of their required
 fields.
 
+### Credentials are optional
+
+Some projects publish a global `settings.xml` that holds no server
+credentials, with mirrors and profiles alone. Omit `server-ids`,
+`username` and `password` to generate such a document: the action then
+leaves out the `<servers>` block entirely, which Maven's settings
+schema permits.
+
+The action validates the credential inputs as a group and fails with a
+clear error on any incoherent combination:
+
+<!-- markdownlint-disable MD013 -->
+
+| Inputs supplied                    | Result                                                 |
+| ---------------------------------- | ------------------------------------------------------ |
+| server-ids, username and password  | `<servers>` block with one entry per server id         |
+| none of the three                  | No `<servers>` block                                   |
+| username without password, or vice | `Error: supply username and password together`         |
+| versa                              |                                                        |
+| server-ids without credentials     | `Error: server-ids requires username and password`     |
+| credentials without server-ids     | `Error: server-ids must contain at least one id`       |
+| no credentials, mirror or profile  | `Error: set server credentials, a mirror or a profile` |
+
+<!-- markdownlint-enable MD013 -->
+
+The action treats a `server-ids` value of whitespace as omitted. A value
+of bare commas counts as supplied: without credentials it fails as
+`server-ids` without credentials, and with them it fails the
+at-least-one-id check.
+
 ## Outputs
 
 <!-- markdownlint-disable MD013 -->
@@ -91,7 +124,9 @@ fields.
 ## Implementation Details
 
 - The action registers the `password` with `::add-mask::` to keep it out
-  of workflow logs.
+  of workflow logs, before validating any input.
+- The action creates the settings file with `umask 077`, so a new file
+  is readable by the runner user alone.
 - The action XML-escapes element text (IDs, username, password, URLs),
   so values containing `&`, `<` or `>` cannot corrupt the document or
   inject stray elements.
@@ -124,6 +159,26 @@ share the project credentials) together with the public mirror and the
     mirror-url: "https://nexus.onap.org/content/groups/public/"
     profile-id: "onap-public"
     profile-repository-url: "https://nexus.onap.org/content/groups/public/"
+```
+
+<!-- markdownlint-enable MD046 -->
+
+## Example: Mirror and profile without credentials
+
+The following generates a settings document with a public mirror and
+an active profile, and no `<servers>` block:
+
+<!-- markdownlint-disable MD046 -->
+
+```yaml
+- name: "Generate Maven settings without credentials"
+  id: mirror-settings
+  uses: lfreleng-actions/maven-xml-settings-action@main
+  with:
+    mirror-id: "public"
+    mirror-url: "https://nexus.example.org/content/groups/public/"
+    profile-id: "public"
+    profile-repository-url: "https://nexus.example.org/content/groups/public/"
 ```
 
 <!-- markdownlint-enable MD046 -->
