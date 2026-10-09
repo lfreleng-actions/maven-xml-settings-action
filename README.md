@@ -183,6 +183,17 @@ an active profile, and no `<servers>` block:
 
 <!-- markdownlint-enable MD046 -->
 
+## Testing
+
+Besides comparing the generated document with the fixtures under
+`tests/fixtures`, the `compatibility` job runs real Maven against the
+generated settings, on every Maven release and JDK that
+[`java-workflows`](https://github.com/lfreleng-actions/java-workflows)
+publishes. Maven deploys to, and resolves through the mirror and the
+active profile of, a local repository that refuses any request without
+the configured credentials. `.github/scripts/maven-scenarios.sh` drives the
+scenarios and also runs outside GitHub Actions.
+
 ## Notes
 
 The action performs no network access and renders XML from its inputs
