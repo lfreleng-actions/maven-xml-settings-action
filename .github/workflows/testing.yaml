@@ -285,3 +285,161 @@ jobs:
           fi
 
           echo "Validation rejected inputs with: ${EXPECTED_ERROR} ✅"
+
+  # The Maven releases and Java versions the Java/Maven estate tests
+  # against, published by java-workflows for every repository in it.
+  versions:
+    name: "Java/Maven versions"
+    permissions: {}
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/java-workflows/.github/workflows/java-maven-versions.yaml@c0a33e2ec6357244055df8b32aaf78d94e2b9514  # main
+
+  ### Real Maven must authenticate with the generated settings ###
+  # The jobs above compare the document with fixtures; only Maven can
+  # say whether it honours it. How Maven offers settings credentials
+  # has changed between releases (3.10 scopes them to repository
+  # origins), so every release and JDK under test deploys and resolves
+  # through a repository that refuses any request without them.
+  compatibility:
+    # yamllint disable-line rule:line-length
+    name: "Maven compatibility (Maven ${{ matrix.maven.line }}, JDK ${{ matrix.java }})"
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Maven is installed below rather than taken from the runner
+        # image, whose Maven moves on without notice. Each entry
+        # carries the archive's digest, pinned where the versions are
+        # published rather than fetched beside the tarball, where it
+        # would prove only that the download completed.
+        maven: ${{ fromJSON(needs.versions.outputs.maven) }}
+        java: ${{ fromJSON(needs.versions.outputs.java) }}
+    steps:
+      # A newer allow-list than the jobs above: setup-java fetches
+      # JDKs 22 to 24 through api.adoptium.net, which v0.1.1 predates.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@ac32415b91e0b6db1166bc451024c472cdbcbd3d'  # v0.16.8
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Set up Java ${{ matrix.java }}"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: ${{ matrix.java }}
+
+      - name: "Install Maven ${{ matrix.maven.version }}"
+        shell: bash
+        env:
+          MAVEN_VERSION: ${{ matrix.maven.version }}
+          MAVEN_SHA512: ${{ matrix.maven.sha512 }}
+        run: |
+          set -euo pipefail
+          name="apache-maven-${MAVEN_VERSION}"
+          base="https://repo1.maven.org/maven2/org/apache/maven/apache-maven"
+          archive="${RUNNER_TEMP}/${name}-bin.tar.gz"
+          curl -sfSL -o "${archive}" \
+            "${base}/${MAVEN_VERSION}/${name}-bin.tar.gz"
+          echo "${MAVEN_SHA512}  ${archive}" | sha512sum -c -
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/${name}/bin" >> "${GITHUB_PATH}"
+
+      - name: "Check the toolchain under test"
+        shell: bash
+        env:
+          WANT_MAVEN: ${{ matrix.maven.version }}
+          WANT_JAVA: ${{ matrix.java }}
+        run: |
+          set -euo pipefail
+          version="$(mvn --version)"
+          echo "${version}"
+          status=0
+          if ! grep -qF "Apache Maven ${WANT_MAVEN} (" <<< "${version}"; then
+            echo "::error::mvn is not Maven ${WANT_MAVEN}"
+            status=1
+          fi
+          if ! grep -qE "^Java version: ${WANT_JAVA}[.,]" <<< "${version}"; then
+            echo "::error::Maven does not run on JDK ${WANT_JAVA}"
+            status=1
+          fi
+          case "${JAVA_HOME:-}" in
+            *Temurin*) ;;
+            *) echo "::error::JAVA_HOME is not a Temurin JDK"; status=1 ;;
+          esac
+          exit "${status}"
+
+      # The server answers 401 to any request without these exact
+      # credentials, and logs whether each request carried them.
+      - name: "Start an authenticating repository"
+        id: repo
+        shell: bash
+        env:
+          AUTH_USER: "test-user"
+          AUTH_PASSWORD: "p@ss&<>word"
+        run: |
+          set -euo pipefail
+          url="$(.github/scripts/start-auth-repo.sh "${RUNNER_TEMP}/auth-repo" \
+            "${RUNNER_TEMP}/auth-repo.port" "${RUNNER_TEMP}/auth-repo.log")"
+          echo "url=${url}" >> "${GITHUB_OUTPUT}"
+
+      # The mirror and profile ids are server ids too, so their
+      # repositories take the same credentials. The mirror covers one
+      # repository id the resolve fixture declares: external:* would
+      # exclude localhost, and * would capture Maven Central as well.
+      - name: "Generate settings for the repository"
+        id: settings
+        uses: $/
+        with:
+          server-ids: |
+            xml-settings-snapshots
+            xml-settings-mirror
+            xml-settings-profile
+          username: "test-user"
+          password: "p@ss&<>word"
+          mirror-id: "xml-settings-mirror"
+          mirror-url: "${{ steps.repo.outputs.url }}/mirror"
+          mirror-of: "xml-settings-upstream"
+          profile-id: "xml-settings-profile"
+          profile-repository-url: "${{ steps.repo.outputs.url }}/profile"
+
+      # For the negative control: proves the server enforces the
+      # password, so the scenarios that pass mean something.
+      - name: "Generate settings with a wrong password"
+        id: wrong
+        uses: $/
+        with:
+          server-ids: "xml-settings-snapshots"
+          username: "test-user"
+          password: "wrong-password"
+          settings-path: "${{ runner.temp }}/wrong-settings.xml"
+
+      - name: "Deploy and resolve with the generated settings"
+        shell: bash
+        env:
+          SERVER_URL: ${{ steps.repo.outputs.url }}
+          SETTINGS: ${{ steps.settings.outputs.settings-path }}
+          WRONG_SETTINGS: ${{ steps.wrong.outputs.settings-path }}
+        run: |
+          set -euo pipefail
+          .github/scripts/maven-scenarios.sh \
+            "${RUNNER_TEMP}/auth-repo" "${SERVER_URL}" \
+            "${RUNNER_TEMP}/auth-repo.log" "${SETTINGS}" "${WRONG_SETTINGS}"
